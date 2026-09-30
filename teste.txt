@@ -1,0 +1,315 @@
+"""
+Lambda de administração de Feature Flags no DynamoDB.
+
+Suporta DUAS formas de invocação, com o MESMO código:
+
+1) Invocação direta (lambda_client.invoke / CLI / console "Test")
+   -> event já É o payload:
+      {"action": "set", "pk": "mtls", ...}
+
+2) Invocação via Function URL com IAM auth (sigv4), OU via API Gateway
+   com autorizador IAM
+   -> event vem no formato HTTP (tem "requestContext"), e o payload
+      fica em event["body"] (string JSON). A identidade de quem chamou
+      é extraída automaticamente do requestContext (ver extract_caller_identity).
+
+Em ambos os casos, múltiplas "coleções" são suportadas via o
+campo "pk" no payload (ex: "tagueamento", "mtls").
+
+Estrutura do item no DynamoDB:
+{
+  "PK": "<pk>",
+  "SK": "ENV#<environment>#PRODUCT#<product>",
+  "environment": "prod" | "qa" | ...,
+  "product": "android" | "ios" | ...,
+  "enabled": true | false,
+  "user": "usuario1",
+  "updateDate": "2026-09-27T12:00:00.000000+00:00"
+}
+
+Ações suportadas via campo "action":
+  - get, list, list_pks, set, delete
+"""
+
+import os
+import json
+import re
+import boto3
+from datetime import datetime, timezone
+from botocore.exceptions import ClientError
+
+TABLE_NAME = os.environ.get("TABLE_NAME", "FeatureFlags")
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
+
+
+# --------------------------------------------------------------------------
+# Detecção de formato de evento (direto vs HTTP/Function URL/API Gateway)
+# --------------------------------------------------------------------------
+
+def is_http_event(event):
+    """Function URL e API Gateway sempre trazem 'requestContext'."""
+    return isinstance(event, dict) and "requestContext" in event
+
+
+def extract_payload(event):
+    """
+    Retorna (payload_dict, is_http).
+    - Invocação direta: event já é o payload.
+    - Invocação HTTP: payload vem em event['body'] (string JSON),
+      combinado com querystring (se houver) como fallback.
+    """
+    if not is_http_event(event):
+        return event, False
+
+    body = event.get("body") or "{}"
+    if event.get("isBase64Encoded"):
+        import base64
+        body = base64.b64decode(body).decode("utf-8")
+
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    # fallback: permite também `?action=list&pk=mtls` via querystring
+    qs = event.get("queryStringParameters") or {}
+    for key, value in qs.items():
+        payload.setdefault(key, value)
+
+    return payload, True
+
+
+def extract_caller_identity(event):
+    """
+    Extrai a identidade IAM de quem chamou, quando disponível
+    (só existe em invocação via Function URL/API Gateway com IAM auth).
+    Retorna None em invocação direta.
+    """
+    request_context = event.get("requestContext", {})
+
+    # Lambda Function URL com auth IAM
+    iam = request_context.get("authorizer", {}).get("iam", {})
+    arn = iam.get("userArn")
+
+    # API Gateway REST API com autorizador IAM
+    if not arn:
+        arn = request_context.get("identity", {}).get("userArn")
+
+    if not arn:
+        return None
+
+    match = re.search(r"(user|assumed-role)/([^/]+)/?([^/]*)$", arn)
+    if match:
+        return match.group(3) or match.group(2)
+    return arn
+
+
+# --------------------------------------------------------------------------
+# Helpers de negócio
+# --------------------------------------------------------------------------
+
+def build_sk(environment, product):
+    return f"ENV#{environment}#PRODUCT#{product}"
+
+
+def validate_required(payload, fields):
+    missing = [f for f in fields if not payload.get(f)]
+    if missing:
+        raise ValueError(f"Campo(s) obrigatório(s) ausente(s): {', '.join(missing)}")
+
+
+# --------------------------------------------------------------------------
+# Handler
+# --------------------------------------------------------------------------
+
+def lambda_handler(event, context):
+    payload, http = extract_payload(event)
+    caller_user = extract_caller_identity(event) if http else None
+
+    action = payload.get("action")
+
+    try:
+        if action == "get":
+            result = handle_get(payload)
+        elif action == "list":
+            result = handle_list(payload)
+        elif action == "list_pks":
+            result = handle_list_pks(payload)
+        elif action == "set":
+            result = handle_set(payload, caller_user)
+        elif action == "delete":
+            result = handle_delete(payload)
+        else:
+            result = {
+                "statusCode": 400,
+                "message": (
+                    f'Ação inválida ou ausente: "{action}". '
+                    "Use action = get | list | list_pks | set | delete."
+                ),
+            }
+    except ValueError as e:
+        result = {"statusCode": 400, "message": str(e)}
+    except ClientError as e:
+        result = {"statusCode": 500, "message": e.response["Error"]["Message"]}
+    except Exception as e:  # fallback genérico
+        result = {"statusCode": 500, "message": str(e)}
+
+    return format_response(result, http)
+
+
+def format_response(result, http):
+    """
+    Invocação direta: devolve o dict puro (como antes).
+    Invocação HTTP: precisa do envelope {statusCode, headers, body}
+    exigido por Function URL / API Gateway.
+    """
+    if not http:
+        return result
+
+    status_code = result.get("statusCode", 200)
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(result, default=str),
+    }
+
+
+# --------------------------------------------------------------------------
+# Ações
+# --------------------------------------------------------------------------
+
+def handle_get(payload):
+    validate_required(payload, ["pk", "environment", "product"])
+    pk = payload["pk"]
+    environment = payload["environment"]
+    product = payload["product"]
+
+    response = table.get_item(
+        Key={"PK": pk, "SK": build_sk(environment, product)}
+    )
+    item = response.get("Item")
+
+    if not item:
+        return {"statusCode": 404, "message": "Flag não encontrada."}
+    return {"statusCode": 200, "item": item}
+
+
+def handle_list(payload):
+    validate_required(payload, ["pk"])
+    pk = payload["pk"]
+    environment = payload.get("environment")
+    product = payload.get("product")
+
+    response = table.query(
+        KeyConditionExpression=boto3.dynamodb.conditions.Key("PK").eq(pk)
+    )
+    items = response.get("Items", [])
+
+    if environment:
+        items = [i for i in items if i.get("environment") == environment]
+    if product:
+        items = [i for i in items if i.get("product") == product]
+
+    return {"statusCode": 200, "items": items}
+
+
+def handle_list_pks(payload):
+    pks = set()
+    scan_kwargs = {"ProjectionExpression": "PK"}
+    done = False
+    start_key = None
+
+    while not done:
+        if start_key:
+            scan_kwargs["ExclusiveStartKey"] = start_key
+        response = table.scan(**scan_kwargs)
+        for item in response.get("Items", []):
+            pks.add(item["PK"])
+        start_key = response.get("LastEvaluatedKey")
+        done = start_key is None
+
+    return {"statusCode": 200, "pks": sorted(pks)}
+
+
+def handle_set(payload, caller_user):
+    validate_required(payload, ["pk", "environment", "product"])
+    pk = payload["pk"]
+    environment = payload["environment"]
+    product = payload["product"]
+    enabled = payload.get("enabled")
+
+    # prioridade: user explícito no payload > identidade IAM do chamador (via URL)
+    user = payload.get("user") or caller_user
+    if not user:
+        raise ValueError(
+            'Campo "user" ausente. Informe explicitamente ou invoque via '
+            "Function URL/API Gateway com auth IAM para captura automática."
+        )
+
+    if not isinstance(enabled, bool):
+        raise ValueError('O campo "enabled" deve ser booleano (true/false).')
+
+    item = {
+        "PK": pk,
+        "SK": build_sk(environment, product),
+        "environment": environment,
+        "product": product,
+        "enabled": enabled,
+        "user": user,
+        "updateDate": datetime.now(timezone.utc).isoformat(),
+    }
+
+    table.put_item(Item=item)
+    return {"statusCode": 200, "message": "Flag salva com sucesso.", "item": item}
+
+
+def handle_delete(payload):
+    validate_required(payload, ["pk", "environment", "product"])
+    pk = payload["pk"]
+    environment = payload["environment"]
+    product = payload["product"]
+
+    table.delete_item(Key={"PK": pk, "SK": build_sk(environment, product)})
+    return {"statusCode": 200, "message": "Flag removida com sucesso."}
+
+
+
+
+
+
+
+
+{ "action": "set", "pk": "mtls", "environment": "prod", "product": "android", "enabled": true, "user": "usuario1" }
+
+
+
+{ "action": "get", "pk": "tagueamento", "environment": "qa", "product": "android" }
+
+{ "action": "list", "pk": "mtls" }
+
+{ "action": "list_pks" }
+
+
+
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FeatureFlagsTableAccess",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:Scan"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:SEU_ACCOUNT_ID:table/FeatureFlags"
+    }
+  ]
+}
+
+{ "action": "delete", "pk": "mtls", "environment": "qa", "product": "ios" }
