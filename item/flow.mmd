@@ -1,0 +1,152 @@
+flowchart LR
+  SPLASH([Splash]) --> LOGIN
+
+  subgraph AUTH["LoginActivity"]
+    LOGIN[Login]
+    LOGGED[Logged - sessão ativa]
+    BLOCKED{{Conta bloqueada}}
+    TEMPPW{{Senha temporária}}
+    TEMPDONE{{Senha temporária OK}}
+    HELPDEV[Ajuda novo dispositivo 1]
+    HELPDEV2[Ajuda novo dispositivo 2]
+    CHDEV[Troca de dispositivo - código SMS]
+    BLOCKDEV[Dispositivo bloqueado]
+    LOGIN --> LOGGED
+    LOGIN -.-> BLOCKED
+    LOGIN -.-> TEMPPW --> TEMPDONE
+    LOGIN -.-> HELPDEV --> HELPDEV2 --> CHDEV
+    CHDEV -.-> BLOCKDEV
+  end
+
+  subgraph REG["RegisterActivity - Cadastro"]
+    R1[Cartão]
+    R2[Data nasc. + cartão]
+    R3[Telefone]
+    R4[Código SMS]
+    R5[Senha]
+    R6{{Cadastro concluído}}
+    RP{{Problemas}}
+    RB{{Bloqueado}}
+    R1 -.-> R2 -.-> R3 --> R4 --> R5 --> R6
+    R1 -.-> RP
+    R4 -.-> RB
+  end
+
+  subgraph REC["RecoverPasswordActivity - Recuperar senha"]
+    P1[Cartão]
+    P2[Tipo de recuperação]
+    P3[OTP]
+    P4[Nova senha]
+    P5{{Concluído}}
+    PP{{Problemas}}
+    PB{{Bloqueado}}
+    PE{{Limite excedido}}
+    P1 -.-> P2 -.-> P3 -.-> P4 -.-> P5
+    P1 -.-> PP
+    P3 -.-> PB
+    P3 -.-> PE
+  end
+
+  LOGIN --> R1
+  LOGIN --> P1
+  CHDEV --> R4
+  P1 -->|sem cadastro| R1
+  P5 --> LOGIN
+  LOGGED --> HOME
+  R6 --> HOME
+
+  subgraph HOMEG["HomeActivity - navegação inferior"]
+    HOME[Home]
+    CARDS[Cartões]
+    MYPAY[Meus pagamentos]
+    MORE[Mais opções]
+    HELPTAB[Ajuda - aba]
+    SETT[Configurações]
+    HOME --- CARDS
+    HOME --- MYPAY
+    HOME --- MORE
+    HOME --- HELPTAB
+    HOME --- SETT
+  end
+
+  CARDS --> MAINC[MainComposeActivity - Compose]
+  CARDS --> ACCST
+  CARDS --> PROMO
+  CARDS --> TRANS
+
+  subgraph ACC["AccountStatusActivity"]
+    ACCST[Estado de conta]
+    ACCEM[Estado de conta - e-mail]
+    ACCST --> ACCEM
+  end
+
+  subgraph PRM["PromotionsActivity"]
+    PROMO[Promoções]
+    PROMOD[Detalhe da promoção]
+    PROMO --> PROMOD
+  end
+
+  TRANS[TransactionsActivity - Movimentos]
+  TRANS --> CLAR1
+
+  MYPAY --> MPO[Onboarding Meus pagamentos]
+  MYPAY --> DPO[Onboarding Débito]
+  MYPAY --> BAR[PaymentCodeBarActivity - Pago por código de barras]
+  MYPAY --> DEB[DebitPaymentActivity - Pago com débito]
+  MYPAY --> MCI[MonthsWithInterestActivity - Meses com juros]
+  MYPAY --> AGR[PaymentAgreementsActivity - Acordos de pagamento]
+  DPO --> DEB
+  MPO --> BAR
+  DEB --> PLACES
+  AGR --> PLACES
+  CASH[CashWithdrawalActivity - Saque sem cartão]
+
+  MORE --> DOUBTS[DoubtsActivity - Dúvidas]
+  MORE --> HELP
+  MORE --> LEGAL
+  MORE --> PLACES[PlacesPaymentActivity - Locais de pagamento]
+  MORE -->|logout| LOGIN
+  DEB --> DOUBTS
+  HELPTAB --> CLAR1
+  HOME --> NOTIF[NotificationsActivity]
+  HOME --> HELP[HelpActivity - Ajuda]
+  HELP --> NOTIF
+  TRANS --> NOTIF
+
+  subgraph FIN["FinancialEducationActivity"]
+    FE1[Educação financeira]
+    FE2[Detalhe]
+    FE1 --> FE2
+  end
+
+  LEGAL[LegalLegendsActivity - Leyendas legales]
+  R1 --> LEGAL
+  MCI --> LEGAL
+  AGR --> LEGAL
+  CASH --> LEGAL
+  ACCEM --> LEGAL
+
+  subgraph CLA["ClarificationsActivity - Aclaraciones"]
+    CLAR1[Lista de aclaraciones]
+    CLARD[Detalhe da aclaração]
+    CLARI[Informação]
+    CLARC[Seleção de cartão]
+    CLARQ[Perguntas]
+    CLART[Transações]
+    CLARR[Detalhe do reporte]
+    CLARS[Resumo]
+    CLARA[Adicionar transações]
+    CLARX[Comprovante]
+    FAQ[FAQs]
+    CLAR1 --> CLARI
+    CLAR1 --> CLARD
+    CLAR1 --> FAQ
+    CLARI --> CLARC --> CLARQ
+    CLARI --> CLARQ
+    CLARQ --> CLART --> CLARR --> CLARS
+    CLARS --> CLARA
+    CLARS --> CLARX
+    CLARQ -->|cancelar| CLAR1
+  end
+
+  CLAR1 -->|voltar| HOME
